@@ -7,13 +7,13 @@ Classes named as ``*Error`` or ``*Loss`` return a value to minimize:
 the lower the better.
 """
 
-from sktime.performance_metrics.forecasting._base import BaseForecastingErrorMetricFunc
-from sktime.performance_metrics.forecasting._functions import (
-    geometric_mean_squared_error,
-)
+import numpy as np
+from scipy.stats import gmean
+
+from sktime.performance_metrics.forecasting._base import BaseForecastingErrorMetric
 
 
-class GeometricMeanSquaredError(BaseForecastingErrorMetricFunc):
+class GeometricMeanSquaredError(BaseForecastingErrorMetric):
     """Geometric mean squared error (GMSE) or Root geometric mean squared error (RGMSE).
 
     If ``square_root`` is False then calculates GMSE and if ``square_root`` is True
@@ -31,6 +31,10 @@ class GeometricMeanSquaredError(BaseForecastingErrorMetricFunc):
         Whether to take the square root of the mean squared error.
         If True, returns root geometric mean squared error (RGMSE)
         If False, returns geometric mean squared error (GMSE)
+
+    eps : float, default=None
+        Epsilon value to replace zero errors with, to avoid issues with geometric mean.
+        If None, defaults to np.finfo(np.float64).eps
 
     multioutput : 'uniform_average' (default), 1D array-like, or 'raw_values'
         Whether and how to aggregate metric for multivariate (multioutput) data.
@@ -118,19 +122,122 @@ class GeometricMeanSquaredError(BaseForecastingErrorMetricFunc):
     np.float64(0.7000014418652152)
     """
 
-    func = geometric_mean_squared_error
-
     def __init__(
         self,
         multioutput="uniform_average",
         multilevel="uniform_average",
         square_root=False,
         by_index=False,
+        eps=None,
     ):
         self.square_root = square_root
+        self.eps = eps
         super().__init__(
             multioutput=multioutput, multilevel=multilevel, by_index=by_index
         )
+
+    def _evaluate(self, y_true, y_pred, **kwargs):
+        """Evaluate the desired metric on given inputs.
+
+        private _evaluate containing core logic, called from evaluate
+
+        Parameters
+        ----------
+        y_true : pandas.DataFrame with RangeIndex, integer index, or DatetimeIndex
+            Ground truth (correct) target values.
+            Time series in sktime ``pd.DataFrame`` format for ``Series`` type.
+
+        y_pred : pandas.DataFrame with RangeIndex, integer index, or DatetimeIndex
+            Predicted values to evaluate.
+            Time series in sktime ``pd.DataFrame`` format for ``Series`` type.
+
+        Returns
+        -------
+        loss : float or np.ndarray
+            Calculated metric, possibly averaged by variable given ``multioutput``.
+
+            * float if ``multioutput="uniform_average" or array-like,
+              Value is metric averaged over variables and levels (see class docstring)
+            * ``np.ndarray`` of shape ``(y_true.columns,)``
+              if `multioutput="raw_values"``
+              i-th entry is the, metric calculated for i-th variable
+        """
+        multioutput = self.multioutput
+        eps = self.eps
+
+        if eps is None:
+            eps = np.finfo(np.float64).eps
+
+        errors = y_true - y_pred
+        errors = np.where(errors == 0.0, eps, errors)
+
+        squared_errors = errors**2
+        squared_errors = self._get_weighted_df(squared_errors, **kwargs)
+        gmse = squared_errors.apply(lambda x: gmean(x), axis=0)
+
+        if self.square_root:
+            gmse = gmse.pow(0.5)
+
+        return self._handle_multioutput(gmse, multioutput)
+
+    def _evaluate_by_index(self, y_true, y_pred, **kwargs):
+        """Return the metric evaluated at each time point.
+
+        private _evaluate_by_index containing core logic, called from evaluate_by_index
+
+        Parameters
+        ----------
+        y_true : pandas.DataFrame with RangeIndex, integer index, or DatetimeIndex
+            Ground truth (correct) target values.
+            Time series in sktime ``pd.DataFrame`` format for ``Series`` type.
+
+        y_pred : pandas.DataFrame with RangeIndex, integer index, or DatetimeIndex
+            Predicted values to evaluate.
+            Time series in sktime ``pd.DataFrame`` format for ``Series`` type.
+
+        Returns
+        -------
+        loss : pd.Series or pd.DataFrame
+            Calculated metric, by time point (default=jackknife pseudo-values).
+
+            * pd.Series if self.multioutput="uniform_average" or array-like;
+              index is equal to index of y_true;
+              entry at index i is metric at time i, averaged over variables.
+            * pd.DataFrame if self.multioutput="raw_values";
+              index and columns equal to those of y_true;
+              i,j-th entry is metric at time i, at variable j.
+        """
+        multioutput = self.multioutput
+        eps = self.eps
+
+        if eps is None:
+            eps = np.finfo(np.float64).eps
+        errors = y_true - y_pred
+        errors = np.where(errors == 0.0, eps, errors)
+
+        squared_errors = errors**2
+
+        if self.square_root:
+            n = squared_errors.shape[0]
+            gmse = squared_errors.apply(lambda x: gmean(x), axis=0)
+            rgmse = gmse.pow(0.5)
+            rgmse_jackknife = squared_errors.copy()
+            for col in squared_errors.columns:
+                col_data = squared_errors[col].values
+                for i in range(n):
+                    data_without_i = np.concatenate([col_data[:i], col_data[i + 1 :]])
+                    gmse_without_i = gmean(data_without_i)
+                    rgmse_jackknife.iloc[i, squared_errors.columns.get_loc(col)] = (
+                        np.sqrt(gmse_without_i)
+                    )
+
+            pseudo_values = n * rgmse - (n - 1) * rgmse_jackknife
+        else:
+            pseudo_values = squared_errors
+
+        pseudo_values = self._get_weighted_df(pseudo_values, **kwargs)
+
+        return self._handle_multioutput(pseudo_values, multioutput)
 
     @classmethod
     def get_test_params(cls, parameter_set="default"):
